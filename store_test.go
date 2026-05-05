@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"io/ioutil"
+	"sync"
 	"testing"
 )
 
@@ -58,6 +59,90 @@ func TestStore(t *testing.T) {
 	}
 }
 
+func TestStoreDedupe(t *testing.T) {
+	s := newStore()
+	id := generateID()
+	defer teardown(t, s)
+
+	key := "dedupe_me"
+	data := []byte("identical bytes")
+
+	if _, err := s.Write(id, key, bytes.NewReader(data)); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.DedupeHits(); got != 0 {
+		t.Errorf("first write should not dedupe, got hits=%d", got)
+	}
+
+	// Second write with same key + content: must short-circuit and bump counter.
+	if _, err := s.Write(id, key, bytes.NewReader(data)); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.DedupeHits(); got != 1 {
+		t.Errorf("second write should dedupe, got hits=%d", got)
+	}
+}
+
+func TestStoreEncryptedAtRest(t *testing.T) {
+	s := newStore()
+	id := generateID()
+	defer teardown(t, s)
+
+	key := "secret"
+	plaintext := []byte("plaintext that must not appear on disk")
+	encKey := newEncryptionKey()
+
+	if _, err := s.WriteEncrypt(encKey, id, key, bytes.NewReader(plaintext)); err != nil {
+		t.Fatal(err)
+	}
+
+	// Disk bytes are ciphertext, so a plaintext substring search must miss.
+	_, raw, err := s.Read(id, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rawBytes, _ := ioutil.ReadAll(raw)
+	if bytes.Contains(rawBytes, plaintext) {
+		t.Fatalf("plaintext leaked to disk: %q", rawBytes)
+	}
+
+	// ReadDecrypt must round-trip cleanly.
+	_, dec, err := s.ReadDecrypt(encKey, id, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _ := ioutil.ReadAll(dec)
+	if !bytes.Equal(got, plaintext) {
+		t.Errorf("decrypt mismatch: want %q got %q", plaintext, got)
+	}
+}
+
+func TestStoreConcurrentWritesDistinctKeys(t *testing.T) {
+	s := newStore()
+	id := generateID()
+	defer teardown(t, s)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 32; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			key := fmt.Sprintf("k_%d", i)
+			if _, err := s.Write(id, key, bytes.NewReader([]byte(key))); err != nil {
+				t.Errorf("write %s: %v", key, err)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	for i := 0; i < 32; i++ {
+		key := fmt.Sprintf("k_%d", i)
+		if !s.Has(id, key) {
+			t.Errorf("missing key %s after concurrent writes", key)
+		}
+	}
+}
+
 func newStore() *Store {
 	opts := StoreOpts{
 		PathTransformFunc: CASPathTransformFunc,
@@ -68,5 +153,27 @@ func newStore() *Store {
 func teardown(t *testing.T, s *Store) {
 	if err := s.Clear(); err != nil {
 		t.Error(err)
+	}
+}
+
+func TestStoreDeleteAfterDedupe(t *testing.T) {
+	// Regression cover: dedupe-skipped writes must still be deletable.
+	s := newStore()
+	id := generateID()
+	defer teardown(t, s)
+
+	key := "k"
+	data := []byte("payload")
+	if _, err := s.Write(id, key, bytes.NewReader(data)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Write(id, key, bytes.NewReader(data)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Delete(id, key); err != nil {
+		t.Fatal(err)
+	}
+	if s.Has(id, key) {
+		t.Error("file still present after delete")
 	}
 }

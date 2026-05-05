@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha1"
 	"encoding/binary"
 	"encoding/gob"
 	"fmt"
@@ -50,19 +51,31 @@ func NewFileServer(opts FileServerOpts) *FileServer {
 	}
 }
 
-func (s *FileServer) broadcast(msg *Message) error {
-	buf := new(bytes.Buffer)
-	if err := gob.NewEncoder(buf).Encode(msg); err != nil {
+// writeFrame serializes msg as gob, prepends [type byte][4-byte BE length],
+// and writes the resulting frame to peer in a single send to keep it atomic
+// with respect to the peer's read loop.
+func writeFrame(peer p2p.Peer, msg *Message) error {
+	body := new(bytes.Buffer)
+	if err := gob.NewEncoder(body).Encode(msg); err != nil {
 		return err
 	}
+	frame := new(bytes.Buffer)
+	frame.WriteByte(p2p.IncomingMessage)
+	if err := binary.Write(frame, binary.BigEndian, uint32(body.Len())); err != nil {
+		return err
+	}
+	frame.Write(body.Bytes())
+	return peer.Send(frame.Bytes())
+}
 
+func (s *FileServer) broadcast(msg *Message) error {
+	s.peerLock.Lock()
+	defer s.peerLock.Unlock()
 	for _, peer := range s.peers {
-		peer.Send([]byte{p2p.IncomingMessage})
-		if err := peer.Send(buf.Bytes()); err != nil {
+		if err := writeFrame(peer, msg); err != nil {
 			return err
 		}
 	}
-
 	return nil
 }
 
@@ -71,9 +84,8 @@ type Message struct {
 }
 
 type MessageStoreFile struct {
-	ID   string
-	Key  string
-	Size int64
+	ID  string
+	Key string
 }
 
 type MessageGetFile struct {
@@ -81,91 +93,141 @@ type MessageGetFile struct {
 	Key string
 }
 
+// fileChecksumLen is the byte length of the SHA-1 prefix that precedes
+// every ciphertext file payload sent over the wire. Receivers re-hash the
+// trailing bytes and compare; mismatch means rejected + not stored.
+const fileChecksumLen = sha1.Size
+
+// sendFileStream sends [IncomingStream][WriteStream of (sha1 || ciphertext)]
+// to peer, computing the SHA-1 over ciphertext for end-to-end verification.
+func sendFileStream(peer p2p.Peer, ciphertext []byte) error {
+	if err := peer.Send([]byte{p2p.IncomingStream}); err != nil {
+		return err
+	}
+	sum := sha1.Sum(ciphertext)
+	body := io.MultiReader(bytes.NewReader(sum[:]), bytes.NewReader(ciphertext))
+	total := int64(fileChecksumLen + len(ciphertext))
+	_, err := p2p.WriteStream(peer, total, body)
+	return err
+}
+
+// recvFileStream is the inverse of sendFileStream. It reads + reassembles the
+// stream from peer, splits off the SHA-1 prefix, and verifies it matches.
+// Returns the ciphertext on success.
+func recvFileStream(peer p2p.Peer) ([]byte, error) {
+	buf := new(bytes.Buffer)
+	total, err := p2p.ReadStream(peer, buf)
+	if err != nil {
+		return nil, err
+	}
+	if total < fileChecksumLen {
+		return nil, fmt.Errorf("stream too short: %d bytes", total)
+	}
+	data := buf.Bytes()
+	want := data[:fileChecksumLen]
+	ciphertext := data[fileChecksumLen:]
+	got := sha1.Sum(ciphertext)
+	if !bytes.Equal(got[:], want) {
+		return nil, fmt.Errorf("checksum mismatch: want %x got %x", want, got)
+	}
+	return ciphertext, nil
+}
+
 func (s *FileServer) Get(key string) (io.Reader, error) {
 	if s.store.Has(s.ID, key) {
 		fmt.Printf("[%s] serving file (%s) from local disk\n", s.Transport.Addr(), key)
-		_, r, err := s.store.Read(s.ID, key)
+		_, r, err := s.store.ReadDecrypt(s.EncKey, s.ID, key)
 		return r, err
 	}
 
 	fmt.Printf("[%s] dont have file (%s) locally, fetching from network...\n", s.Transport.Addr(), key)
 
+	hashed := hashKey(key)
 	msg := Message{
 		Payload: MessageGetFile{
 			ID:  s.ID,
-			Key: hashKey(key),
+			Key: hashed,
 		},
 	}
-
 	if err := s.broadcast(&msg); err != nil {
 		return nil, err
 	}
 
 	time.Sleep(time.Millisecond * 500)
 
+	s.peerLock.Lock()
+	peers := make([]p2p.Peer, 0, len(s.peers))
 	for _, peer := range s.peers {
-		// First read the file size so we can limit the amount of bytes that we read
-		// from the connection, so it will not keep hanging.
-		var fileSize int64
-		binary.Read(peer, binary.LittleEndian, &fileSize)
+		peers = append(peers, peer)
+	}
+	s.peerLock.Unlock()
 
-		n, err := s.store.WriteDecrypt(s.EncKey, s.ID, key, io.LimitReader(peer, fileSize))
-		if err != nil {
-			return nil, err
-		}
-
-		fmt.Printf("[%s] received (%d) bytes over the network from (%s)", s.Transport.Addr(), n, peer.RemoteAddr())
-
+	for _, peer := range peers {
+		ciphertext, err := recvFileStream(peer)
 		peer.CloseStream()
+		if err != nil {
+			fmt.Printf("[%s] stream from %s failed: %s\n", s.Transport.Addr(), peer.RemoteAddr(), err)
+			continue
+		}
+		if _, werr := s.store.Write(s.ID, hashed, bytes.NewReader(ciphertext)); werr != nil {
+			return nil, werr
+		}
+		fmt.Printf("[%s] received (%d) bytes over the network from (%s)\n", s.Transport.Addr(), len(ciphertext), peer.RemoteAddr())
 	}
 
-	_, r, err := s.store.Read(s.ID, key)
+	_, r, err := s.store.ReadDecrypt(s.EncKey, s.ID, hashed)
 	return r, err
 }
 
 func (s *FileServer) Store(key string, r io.Reader) error {
-	var (
-		fileBuffer = new(bytes.Buffer)
-		tee        = io.TeeReader(r, fileBuffer)
-	)
-
-	size, err := s.store.Write(s.ID, key, tee)
+	encrypted := new(bytes.Buffer)
+	n, err := copyEncrypt(s.EncKey, r, encrypted)
 	if err != nil {
+		return err
+	}
+	ciphertext := encrypted.Bytes()
+	hashed := hashKey(key)
+
+	if _, err := s.store.Write(s.ID, hashed, bytes.NewReader(ciphertext)); err != nil {
 		return err
 	}
 
 	msg := Message{
 		Payload: MessageStoreFile{
-			ID:   s.ID,
-			Key:  hashKey(key),
-			Size: size + 16,
+			ID:  s.ID,
+			Key: hashed,
 		},
 	}
-
 	if err := s.broadcast(&msg); err != nil {
 		return err
 	}
 
 	time.Sleep(time.Millisecond * 5)
 
-	peers := []io.Writer{}
+	s.peerLock.Lock()
+	peers := make([]p2p.Peer, 0, len(s.peers))
 	for _, peer := range s.peers {
 		peers = append(peers, peer)
 	}
-	mw := io.MultiWriter(peers...)
-	mw.Write([]byte{p2p.IncomingStream})
-	n, err := copyEncrypt(s.EncKey, fileBuffer, mw)
-	if err != nil {
-		return err
+	s.peerLock.Unlock()
+
+	for _, peer := range peers {
+		if err := sendFileStream(peer, ciphertext); err != nil {
+			return err
+		}
 	}
 
-	fmt.Printf("[%s] received and written (%d) bytes to disk\n", s.Transport.Addr(), n)
-
+	fmt.Printf("[%s] stored and replicated (%d) ciphertext bytes\n", s.Transport.Addr(), n)
 	return nil
 }
 
 func (s *FileServer) Stop() {
 	close(s.quitch)
+}
+
+// Delete removes the local copy of a file. Network replicas are unaffected.
+func (s *FileServer) Delete(key string) error {
+	return s.store.Delete(s.ID, hashKey(key))
 }
 
 func (s *FileServer) OnPeer(p p2p.Peer) error {
@@ -191,6 +253,7 @@ func (s *FileServer) loop() {
 			var msg Message
 			if err := gob.NewDecoder(bytes.NewReader(rpc.Payload)).Decode(&msg); err != nil {
 				log.Println("decoding error: ", err)
+				continue
 			}
 			if err := s.handleMessage(rpc.From, &msg); err != nil {
 				log.Println("handle message error: ", err)
@@ -220,50 +283,52 @@ func (s *FileServer) handleMessageGetFile(from string, msg MessageGetFile) error
 
 	fmt.Printf("[%s] serving file (%s) over the network\n", s.Transport.Addr(), msg.Key)
 
-	fileSize, r, err := s.store.Read(msg.ID, msg.Key)
+	_, rc, err := s.store.Read(msg.ID, msg.Key)
+	if err != nil {
+		return err
+	}
+	if closer, ok := rc.(io.Closer); ok {
+		defer closer.Close()
+	}
+	ciphertext, err := io.ReadAll(rc)
 	if err != nil {
 		return err
 	}
 
-	if rc, ok := r.(io.ReadCloser); ok {
-		fmt.Println("closing readCloser")
-		defer rc.Close()
-	}
-
+	s.peerLock.Lock()
 	peer, ok := s.peers[from]
+	s.peerLock.Unlock()
 	if !ok {
 		return fmt.Errorf("peer %s not in map", from)
 	}
 
-	// First send the "incomingStream" byte to the peer and then we can send
-	// the file size as an int64.
-	peer.Send([]byte{p2p.IncomingStream})
-	binary.Write(peer, binary.LittleEndian, fileSize)
-	n, err := io.Copy(peer, r)
-	if err != nil {
+	if err := sendFileStream(peer, ciphertext); err != nil {
 		return err
 	}
-
-	fmt.Printf("[%s] written (%d) bytes over the network to %s\n", s.Transport.Addr(), n, from)
-
+	fmt.Printf("[%s] sent (%d) ciphertext bytes to %s\n", s.Transport.Addr(), len(ciphertext), from)
 	return nil
 }
 
 func (s *FileServer) handleMessageStoreFile(from string, msg MessageStoreFile) error {
+	s.peerLock.Lock()
 	peer, ok := s.peers[from]
+	s.peerLock.Unlock()
 	if !ok {
 		return fmt.Errorf("peer (%s) could not be found in the peer list", from)
 	}
 
-	n, err := s.store.Write(msg.ID, msg.Key, io.LimitReader(peer, msg.Size))
+	ciphertext, err := recvFileStream(peer)
+	peer.CloseStream()
+	if err != nil {
+		return fmt.Errorf("recv file stream from %s: %w", from, err)
+	}
+
+	n, err := s.store.Write(msg.ID, msg.Key, bytes.NewReader(ciphertext))
 	if err != nil {
 		return err
 	}
 
-	fmt.Printf("[%s] written %d bytes to disk\n", s.Transport.Addr(), n)
-
-	peer.CloseStream()
-
+	fmt.Printf("[%s] written %d ciphertext bytes to disk\n", s.Transport.Addr(), n)
 	return nil
 }
 

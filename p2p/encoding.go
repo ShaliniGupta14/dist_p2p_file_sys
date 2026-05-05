@@ -1,7 +1,9 @@
 package p2p
 
 import (
+	"encoding/binary"
 	"encoding/gob"
+	"fmt"
 	"io"
 )
 
@@ -15,29 +17,38 @@ func (dec GOBDecoder) Decode(r io.Reader, msg *RPC) error {
 	return gob.NewDecoder(r).Decode(msg)
 }
 
+// DefaultDecoder reads length-prefixed frames off the wire.
+//
+// Wire format:
+//
+//	[1 byte type][...payload]
+//
+// type == IncomingMessage:  followed by [4-byte BE uint32 length][length bytes payload]
+// type == IncomingStream:   no payload here; caller reassembles via ReadStream.
 type DefaultDecoder struct{}
 
 func (dec DefaultDecoder) Decode(r io.Reader, msg *RPC) error {
-	peekBuf := make([]byte, 1)
-	if _, err := r.Read(peekBuf); err != nil {
-		return nil
-	}
-
-	// In case of a stream we are not decoding what is being sent over the network.
-	// We are just setting Stream true so we can handle that in our logic.
-	stream := peekBuf[0] == IncomingStream
-	if stream {
-		msg.Stream = true
-		return nil
-	}
-
-	buf := make([]byte, 1028)
-	n, err := r.Read(buf)
-	if err != nil {
+	typeBuf := make([]byte, 1)
+	if _, err := io.ReadFull(r, typeBuf); err != nil {
 		return err
 	}
 
-	msg.Payload = buf[:n]
-
-	return nil
+	switch typeBuf[0] {
+	case IncomingStream:
+		msg.Stream = true
+		return nil
+	case IncomingMessage:
+		var length uint32
+		if err := binary.Read(r, binary.BigEndian, &length); err != nil {
+			return err
+		}
+		payload := make([]byte, length)
+		if _, err := io.ReadFull(r, payload); err != nil {
+			return err
+		}
+		msg.Payload = payload
+		return nil
+	default:
+		return fmt.Errorf("unknown frame type: 0x%x", typeBuf[0])
+	}
 }
